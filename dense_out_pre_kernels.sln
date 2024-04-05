@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 16
+VisualStudioVersion = 16.0.34114.132
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "dense_out_pre_kernels", "dense_out_pre_kernels.vcxproj", "{F6742746-70A8-44C8-95D0-5131F3D84506}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{F6742746-70A8-44C8-95D0-5131F3D84506}.Debug|x64.ActiveCfg = Debug|x64
+		{F6742746-70A8-44C8-95D0-5131F3D84506}.Debug|x64.Build.0 = Debug|x64
+		{F6742746-70A8-44C8-95D0-5131F3D84506}.Release|x64.ActiveCfg = Release|x64
+		{F6742746-70A8-44C8-95D0-5131F3D84506}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {F2229739-DE4A-41D7-ACBB-CC4CD1C07075}
+	EndGlobalSection
+EndGlobal
