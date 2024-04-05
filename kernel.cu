@@ -124,18 +124,18 @@ __global__ void initRandomSeed(unsigned int sequenceStart, unsigned int numSeed,
 }
 //-----------------------------------------------------------------------------
 // Kernel to initialise initial Poisson time-to-spike
-__global__ void initPoissonTimeToSpike(unsigned int numPoisson, const float *d_meanISI, curandState *d_poissonState,
+__global__ void initPoissonTimeToSpike(unsigned int numPoisson, float meanISI, curandState *d_poissonState,
                                        float *d_timeToSpike)
 {
     // Get index of neuron in population
     const int i = threadIdx.x + (blockIdx.x * BLOCK_SIZE);
     if (i < numPoisson) {
-        d_timeToSpike[i] = d_meanISI[i] * exponentialDist(d_poissonState[i]);
+        d_timeToSpike[i] = meanISI * exponentialDist(d_poissonState[i]);
     }
 }
 //-----------------------------------------------------------------------------
 // Kernel to simulate population of poisson neurons
-__global__ void poisson(unsigned int numPoisson, const float *d_meanISI, curandState *d_poissonState,
+__global__ void poisson(unsigned int numPoisson, float meanISI, curandState *d_poissonState,
                         float *d_timeToSpike, unsigned int *d_numOutSpikes, unsigned int *d_outSpikes)
 {
     // Count and buffer to hold spikes output by this block
@@ -146,7 +146,10 @@ __global__ void poisson(unsigned int numPoisson, const float *d_meanISI, curandS
     __shared__ unsigned int blockSpikeOffset;
 
     // Get index of neuron in population
+    const unsigned int batch = blockIdx.y;
     const int i = threadIdx.x + (blockIdx.x * BLOCK_SIZE);
+
+    const unsigned int batchOffset = numPoisson * batch;
 
     // Use first thread in each block to zero spike counts
     if (threadIdx.x == 0) {
@@ -159,27 +162,27 @@ __global__ void poisson(unsigned int numPoisson, const float *d_meanISI, curandS
         float tts = d_timeToSpike[i];
 
         if (tts <= 0.0f) {
-            tts += (d_meanISI[i] * exponentialDist(d_poissonState[i]));
+            tts += (meanISI * exponentialDist(d_poissonState[batchOffset + i]));
 
             // Add spike to output
             unsigned int blockSpikeIndex = atomicAdd(&blockSpikeCount, 1);
             blockOutSpikes[blockSpikeIndex] = i;
         }
 
-        d_timeToSpike[i] = (tts - 1.0f);
+        d_timeToSpike[batchOffset + i] = (tts - 1.0f);
     }
 
     // If block has emitted any spikes, use the first thread to  
     // determine where in global spike output buffer to copy them
     __syncthreads();
     if (threadIdx.x == 0 && blockSpikeCount > 0) {
-        blockSpikeOffset = atomicAdd(&d_numOutSpikes[0], blockSpikeCount);
+        blockSpikeOffset = atomicAdd(&d_numOutSpikes[batch], blockSpikeCount);
     }
 
     // Copy spikes from block output buffer into correct offset in global buffer
     __syncthreads();
     if (threadIdx.x < blockSpikeCount) {
-        d_outSpikes[blockSpikeOffset + threadIdx.x] = blockOutSpikes[threadIdx.x];
+        d_outSpikes[batchOffset + blockSpikeOffset + threadIdx.x] = blockOutSpikes[threadIdx.x];
     }
 }
 //-----------------------------------------------------------------------------
@@ -202,7 +205,6 @@ __global__ void globalAtomic(unsigned int numPre, unsigned int numPost, const un
     
 
     // Loop through spikes blocks
-    float output = 0.0f;
     for (unsigned int b = 0; b < numSpikeBlocks; b++) {
         // Determine how many spikes are in this block
         const unsigned int numSpikesInBlock = (b == (numSpikeBlocks - 1))
@@ -224,7 +226,7 @@ __global__ void globalAtomic(unsigned int numPre, unsigned int numPost, const un
                 const unsigned int synAddress = (s_spike[i] * numPost) + id;
 
                 // Update gradient and back-propagate
-                d_gradient[synBatchOffset + synAddress] -= (d_lambdaI[postBatchOffset + id] * 5.000000000e+00f);
+                d_gradient[synBatchOffset + synAddress] -= 3.0f; (d_lambdaI[postBatchOffset + id] * 5.000000000e+00f);
                 atomicAdd(&d_outCurrents[preBatchOffset + s_spike[i]], d_weights[synAddress] * (d_lambdaV[postBatchOffset + id] - d_lambdaI[postBatchOffset + id]));
             }
         }
@@ -253,8 +255,8 @@ __global__ void globalAtomicLifted(unsigned int numPre, unsigned int numPost, co
     const float lambdaV = (id < numPost) ? d_lambdaV[postBatchOffset + id] : 0.0f;
     const float lambdaI = (id < numPost) ? d_lambdaI[postBatchOffset + id] : 0.0f;
     const float lambdaVI = lambdaV - lambdaI;
+    
     // Loop through spikes blocks
-    float output = 0.0f;
     for (unsigned int b = 0; b < numSpikeBlocks; b++) {
         // Determine how many spikes are in this block
         const unsigned int numSpikesInBlock = (b == (numSpikeBlocks - 1))
@@ -324,7 +326,8 @@ int main(int argc, char *argv[])
         unsigned int numBatch = 32;
         const float dt = 1.0f;
         const float poissonRate = 10.0f;
-    
+        const float poissonMeanISI = 1000.0f / (poissonRate * dt);
+
         // Read mode from command line
         Mode mode;
         if(argc < 2) {
@@ -354,6 +357,7 @@ int main(int argc, char *argv[])
         }
 
         const unsigned int preBlocks = (unsigned int)std::ceil((float)numPre / (float)BLOCK_SIZE);
+        const unsigned int preBatchBlocks = (unsigned int)std::ceil((float)(numPre * numBatch)/ (float)BLOCK_SIZE);
         std::cout << "Mode:" << s_ModeNames[mode] << " pre:" << numPre << ", num post:" << numPost << ", num batch:" << numBatch << std::endl;
     
         CHECK_CUDA_ERRORS(cudaSetDevice(0));
@@ -367,11 +371,25 @@ int main(int argc, char *argv[])
         hostToDeviceCopy(outCurrents, numPre * numBatch);
 
         // Allocate, fill and upload weight array
-        const unsigned int numIndices = numPre * numPost;
-        HostDeviceArray<float> weights = allocateHostDevice<float>(numIndices);
-        std::fill_n(&weights.first[0], numIndices, 1.0f);
-        hostToDeviceCopy(weights, numIndices, true);
+        const unsigned int numSynapses = numPre * numPost;
+        HostDeviceArray<float> weights = allocateHostDevice<float>(numSynapses);
+        std::fill_n(&weights.first[0], numSynapses, 1.0f);
+        hostToDeviceCopy(weights, numSynapses, true);
 
+        // Allocate, fill and upload gradient array
+        const unsigned int numGradients = numSynapses * numBatch;
+        HostDeviceArray<float> gradients = allocateHostDevice<float>(numGradients);
+        std::fill_n(&gradients.first[0], numGradients, 0.0f);
+        hostToDeviceCopy(gradients, numGradients, true);
+
+        // Allocate, fill and upload lambda arrays
+        const unsigned int numLambda = numPost * numBatch;
+        HostDeviceArray<float> lambdaV = allocateHostDevice<float>(numPost * numBatch);
+        HostDeviceArray<float> lambdaI = allocateHostDevice<float>(numPost * numBatch);
+        std::fill_n(&lambdaV.first[0], numLambda, 1.0f);
+        std::fill_n(&lambdaI.first[0], numLambda, 1.0f);
+        hostToDeviceCopy(lambdaV, numLambda, true);
+        hostToDeviceCopy(lambdaI, numLambda, true);
 
         //------------------------------------------------------------------------
         // Configure poisson population
@@ -382,11 +400,6 @@ int main(int argc, char *argv[])
         // Create arrays to hold poisson spikes
         auto poissonSpikes = allocateHostDevice<unsigned int>(numPre * numBatch);
 
-        // Create arrays to hold poisson interspike intervals
-        auto poissonMeanISI = allocateHostDevice<float>(numPre * numBatch);
-        std::fill_n(&poissonMeanISI.first[0], numPre * numBatch, 1000.0 / (poissonRate * dt));
-        hostToDeviceCopy(poissonMeanISI, numPre * numBatch, true);
-
         // Create device random number generator states for poisson generators
         curandState *d_poissonState = nullptr;
         CHECK_CUDA_ERRORS(cudaMalloc(&d_poissonState, numPre * numBatch * sizeof(curandState)));
@@ -394,7 +407,7 @@ int main(int argc, char *argv[])
             Timer<std::milli> t("Seed poisson:");
             // Initialise these seeds using kernel
             // **NOTE** first numPre sequences used by Poisson spike sources
-            initRandomSeed <<<preBlocks, BLOCK_SIZE>>>(numPre, numPre, d_poissonState);
+            initRandomSeed <<<preBatchBlocks, BLOCK_SIZE>>>(0, numPre, d_poissonState);
             cudaDeviceSynchronize();
         }
 
@@ -405,8 +418,7 @@ int main(int argc, char *argv[])
         // Initialise time to spike using kernel
         {
             Timer<std::milli> t("Init poisson TTS:");
-            initPoissonTimeToSpike <<<preBlocks, BLOCK_SIZE>>>(numPre, poissonMeanISI.second, d_poissonState,
-                d_poissonTimeToSpike);
+            initPoissonTimeToSpike <<<preBatchBlocks, BLOCK_SIZE>>>(numPre, poissonMeanISI, d_poissonState, d_poissonTimeToSpike);
             cudaDeviceSynchronize();
         }
 
@@ -424,16 +436,29 @@ int main(int argc, char *argv[])
                 hostToDeviceCopy(poissonNumSpikes, 1);
 
                 // Simulate poisson population
-                poisson <<<preBlocks, 32>>>(numPre, poissonMeanISI.second, d_poissonState,
-                    d_poissonTimeToSpike, poissonNumSpikes.second, poissonSpikes.second);
+                {
+                    dim3 threads(BLOCK_SIZE, 1);
+                    dim3 grid(preBlocks, numBatch);
+                    poisson <<<grid, threads>>>(numPre, poissonMeanISI, d_poissonState, d_poissonTimeToSpike,
+                                                poissonNumSpikes.second, poissonSpikes.second);
+                }
             
                 CHECK_CUDA_ERRORS(cudaEventRecord(kernelStartEvent));
-                if(mode == ModeGlobalAtomic) {
+                
+                {
                     const unsigned int numPostSynapseBlocks = (unsigned int)std::ceil((float)numPost / (float)BLOCK_SIZE);
 
                     dim3 threads(BLOCK_SIZE, 1);
                     dim3 grid(numPostSynapseBlocks, numBatch);
-                    dense<<<grid, threads>>>(numPost, poissonNumSpikes.second, poissonSpikes.second, weights.second, outCurrents.second);
+
+                    if (mode == ModeGlobalAtomic) {
+                        globalAtomic<<<grid, threads>>>(numPre, numPost, poissonNumSpikes.second, poissonSpikes.second,
+                                                        weights.second, lambdaV.second, lambdaI.second,
+                                                        outCurrents.second, gradients.second);
+                    }
+                    else if (mode == ModeGlobalAtomicLifted) {
+
+                    }
                 }
                 
 
