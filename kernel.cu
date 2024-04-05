@@ -226,7 +226,7 @@ __global__ void globalAtomic(unsigned int numPre, unsigned int numPost, const un
                 const unsigned int synAddress = (s_spike[i] * numPost) + id;
 
                 // Update gradient and back-propagate
-                d_gradient[synBatchOffset + synAddress] -= 3.0f; (d_lambdaI[postBatchOffset + id] * 5.000000000e+00f);
+                d_gradient[synBatchOffset + synAddress] -= (d_lambdaI[postBatchOffset + id] * 5.000000000e+00f);
                 atomicAdd(&d_outCurrents[preBatchOffset + s_spike[i]], d_weights[synAddress] * (d_lambdaV[postBatchOffset + id] - d_lambdaI[postBatchOffset + id]));
             }
         }
@@ -378,16 +378,17 @@ int main(int argc, char *argv[])
 
         // Allocate, fill and upload gradient array
         const unsigned int numGradients = numSynapses * numBatch;
+        std::cout << "NUM GRADIENTS:" << numGradients << std::endl;
         HostDeviceArray<float> gradients = allocateHostDevice<float>(numGradients);
         std::fill_n(&gradients.first[0], numGradients, 0.0f);
         hostToDeviceCopy(gradients, numGradients, true);
 
         // Allocate, fill and upload lambda arrays
         const unsigned int numLambda = numPost * numBatch;
-        HostDeviceArray<float> lambdaV = allocateHostDevice<float>(numPost * numBatch);
-        HostDeviceArray<float> lambdaI = allocateHostDevice<float>(numPost * numBatch);
+        HostDeviceArray<float> lambdaV = allocateHostDevice<float>(numLambda);
+        HostDeviceArray<float> lambdaI = allocateHostDevice<float>(numLambda);
         std::fill_n(&lambdaV.first[0], numLambda, 1.0f);
-        std::fill_n(&lambdaI.first[0], numLambda, 1.0f);
+        std::fill_n(&lambdaI.first[0], numLambda, 0.0f);
         hostToDeviceCopy(lambdaV, numLambda, true);
         hostToDeviceCopy(lambdaI, numLambda, true);
 
@@ -432,8 +433,9 @@ int main(int argc, char *argv[])
         {
             // Loop through time
             for (unsigned int t = 0; t < 1000; t++) {
-                poissonNumSpikes.first[0] = 0;
-                hostToDeviceCopy(poissonNumSpikes, 1);
+                // Zero spike counters
+                std::fill_n(&poissonNumSpikes.first[0], numBatch, 0);
+                hostToDeviceCopy(poissonNumSpikes, numBatch);
 
                 // Simulate poisson population
                 {
@@ -457,7 +459,9 @@ int main(int argc, char *argv[])
                                                         outCurrents.second, gradients.second);
                     }
                     else if (mode == ModeGlobalAtomicLifted) {
-
+                        globalAtomicLifted<<<grid, threads>>>(numPre, numPost, poissonNumSpikes.second, poissonSpikes.second,
+                                                              weights.second, lambdaV.second, lambdaI.second,
+                                                              outCurrents.second, gradients.second);
                     }
                 }
                 
