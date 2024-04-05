@@ -42,12 +42,18 @@ enum Mode
 {
     ModeGlobalAtomic,
     ModeGlobalAtomicLifted,
+    ModeSharedAtomic,
+    ModeWarpShuffle,
+    ModeWarpShuffleLifted,
     ModeMax,
 };
 
 const char *const s_ModeNames[] = {
     "Global atomic",
-    "Global atomic lifted",};
+    "Global atomic lifted",
+    "Shared atomic",
+    "Warp shuffle",
+    "Warp shuffle lifted"};
 
 //------------------------------------------------------------------------
 // Timer
@@ -286,6 +292,191 @@ __global__ void globalAtomicLifted(unsigned int numPre, unsigned int numPost, co
     }
 
 }
+//-----------------------------------------------------------------------------
+__global__ void sharedAtomic(unsigned int numPre, unsigned int numPost, const unsigned int* d_numInSpikes,
+    const unsigned int* d_inSpikes, const float* d_weights, const float* d_lambdaV,
+    const float* d_lambdaI, float* d_outCurrents, float* d_gradient)
+{
+    __shared__ unsigned int s_spike[BLOCK_SIZE];
+    __shared__ float s_outCurrents[BLOCK_SIZE];
+
+    const unsigned int batch = blockIdx.y;
+    const unsigned int id = threadIdx.x + (blockIdx.x * BLOCK_SIZE);
+
+    const unsigned int preBatchOffset = numPre * batch;
+    const unsigned int postBatchOffset = numPost * batch;
+    const unsigned int synBatchOffset = preBatchOffset * numPost;
+
+    // Calculate number of blocks (dictated by shared memory) spikes need to be processed in
+    const unsigned int numSpikes = d_numInSpikes[batch];
+    const unsigned int numSpikeBlocks = (numSpikes + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+
+    // Loop through spikes blocks
+    for (unsigned int b = 0; b < numSpikeBlocks; b++) {
+        // Determine how many spikes are in this block
+        const unsigned int numSpikesInBlock = (b == (numSpikeBlocks - 1))
+            ? ((numSpikes - 1) % BLOCK_SIZE) + 1 : BLOCK_SIZE;
+
+        // Use first row of threads in block to read spikes and row lengths into shared memory
+        if (threadIdx.x < numSpikesInBlock) {
+            const unsigned int i = d_inSpikes[preBatchOffset + (b * BLOCK_SIZE) + threadIdx.x];
+            s_spike[threadIdx.x] = i;
+            s_outCurrents[threadIdx.x] = 0.0f;
+        }
+
+        __syncthreads();
+
+        // If there is a synapse for this thread to process
+        if (id < numPost) {
+            // Loop through spikes in block
+            for (unsigned int i = 0; i < numSpikesInBlock; i++) {
+                // Get postsynaptic index
+                const unsigned int synAddress = (s_spike[i] * numPost) + id;
+
+                // Update gradient and back-propagate
+                d_gradient[synBatchOffset + synAddress] -= (d_lambdaI[postBatchOffset + id] * 5.000000000e+00f);
+                atomicAdd(&s_outCurrents[i], d_weights[synAddress] * (d_lambdaV[postBatchOffset + id] - d_lambdaI[postBatchOffset + id]));
+            }
+        }
+
+        __syncthreads();
+
+        if (threadIdx.x < numSpikesInBlock) {
+            atomicAdd(&d_outCurrents[preBatchOffset + s_spike[threadIdx.x]], s_outCurrents[threadIdx.x]);
+        }
+
+        __syncthreads();
+    }
+}
+//-----------------------------------------------------------------------------
+__global__ void warpReduction(unsigned int numPre, unsigned int numPost, const unsigned int* d_numInSpikes,
+    const unsigned int* d_inSpikes, const float* d_weights, const float* d_lambdaV,
+    const float* d_lambdaI, float* d_outCurrents, float* d_gradient)
+{
+    __shared__ unsigned int s_spike[BLOCK_SIZE];
+
+    const unsigned int batch = blockIdx.y;
+    const unsigned int id = threadIdx.x + (blockIdx.x * BLOCK_SIZE);
+    const unsigned int lane = threadIdx.x % 32;
+
+    const unsigned int preBatchOffset = numPre * batch;
+    const unsigned int postBatchOffset = numPost * batch;
+    const unsigned int synBatchOffset = preBatchOffset * numPost;
+
+    // Calculate number of blocks (dictated by shared memory) spikes need to be processed in
+    const unsigned int numSpikes = d_numInSpikes[batch];
+    const unsigned int numSpikeBlocks = (numSpikes + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+
+    // Loop through spikes blocks
+    for (unsigned int b = 0; b < numSpikeBlocks; b++) {
+        // Determine how many spikes are in this block
+        const unsigned int numSpikesInBlock = (b == (numSpikeBlocks - 1))
+            ? ((numSpikes - 1) % BLOCK_SIZE) + 1 : BLOCK_SIZE;
+
+        // Use first row of threads in block to read spikes and row lengths into shared memory
+        if (threadIdx.x < numSpikesInBlock) {
+            const unsigned int i = d_inSpikes[preBatchOffset + (b * BLOCK_SIZE) + threadIdx.x];
+            s_spike[threadIdx.x] = i;
+        }
+
+        __syncthreads();
+
+        // If there is a synapse for this thread to process
+        if (id < numPost) {
+            // Loop through spikes in block
+            for (unsigned int i = 0; i < numSpikesInBlock; i++) {
+                // Get postsynaptic index
+                const unsigned int synAddress = (s_spike[i] * numPost) + id;
+
+                // Update gradient and back-propagate
+                d_gradient[synBatchOffset + synAddress] -= (d_lambdaI[postBatchOffset + id] * 5.000000000e+00f);
+                
+                // Calculate output current
+                float outCurrent = d_weights[synAddress] * (d_lambdaV[postBatchOffset + id] - d_lambdaI[postBatchOffset + id]);
+                
+                // Perform warp-level tree reduction into first lane
+                outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 16);
+                outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 8);
+                outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 4);
+                outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 2);
+                outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 1);
+
+                // Issue atomic add on first lane of warp
+                if (lane == 0) {
+                    atomicAdd(&d_outCurrents[preBatchOffset + s_spike[i]], outCurrent);
+                }
+            }
+        }
+    }
+}
+//-----------------------------------------------------------------------------
+__global__ void warpReductionLifted(unsigned int numPre, unsigned int numPost, const unsigned int* d_numInSpikes,
+    const unsigned int* d_inSpikes, const float* d_weights, const float* d_lambdaV,
+    const float* d_lambdaI, float* d_outCurrents, float* d_gradient)
+{
+    __shared__ unsigned int s_spike[BLOCK_SIZE];
+
+    const unsigned int batch = blockIdx.y;
+    const unsigned int id = threadIdx.x + (blockIdx.x * BLOCK_SIZE);
+    const unsigned int lane = threadIdx.x % 32;
+
+    const unsigned int preBatchOffset = numPre * batch;
+    const unsigned int postBatchOffset = numPost * batch;
+    const unsigned int synBatchOffset = preBatchOffset * numPost;
+
+    // Calculate number of blocks (dictated by shared memory) spikes need to be processed in
+    const unsigned int numSpikes = d_numInSpikes[batch];
+    const unsigned int numSpikeBlocks = (numSpikes + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    // Lift reads of lambda
+    const float lambdaV = (id < numPost) ? d_lambdaV[postBatchOffset + id] : 0.0f;
+    const float lambdaI = (id < numPost) ? d_lambdaI[postBatchOffset + id] : 0.0f;
+    const float lambdaVI = lambdaV - lambdaI;
+
+    // Loop through spikes blocks
+    for (unsigned int b = 0; b < numSpikeBlocks; b++) {
+        // Determine how many spikes are in this block
+        const unsigned int numSpikesInBlock = (b == (numSpikeBlocks - 1))
+            ? ((numSpikes - 1) % BLOCK_SIZE) + 1 : BLOCK_SIZE;
+
+        // Use first row of threads in block to read spikes and row lengths into shared memory
+        if (threadIdx.x < numSpikesInBlock) {
+            const unsigned int i = d_inSpikes[preBatchOffset + (b * BLOCK_SIZE) + threadIdx.x];
+            s_spike[threadIdx.x] = i;
+        }
+
+        __syncthreads();
+
+        // If there is a synapse for this thread to process
+        if (id < numPost) {
+            // Loop through spikes in block
+            for (unsigned int i = 0; i < numSpikesInBlock; i++) {
+                // Get postsynaptic index
+                const unsigned int synAddress = (s_spike[i] * numPost) + id;
+
+                // Update gradient and back-propagate
+                d_gradient[synBatchOffset + synAddress] -= (lambdaI * 5.000000000e+00f);
+
+                // Calculate output current
+                float outCurrent = d_weights[synAddress] * lambdaVI;
+
+                // Perform warp-level tree reduction into first lane
+                outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 16);
+                outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 8);
+                outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 4);
+                outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 2);
+                outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 1);
+
+                // Issue atomic add on first lane of warp
+                if (lane == 0) {
+                    atomicAdd(&d_outCurrents[preBatchOffset + s_spike[i]], outCurrent);
+                }
+            }
+        }
+    }
+}
 
 //-----------------------------------------------------------------------------
 // Host functions
@@ -366,9 +557,10 @@ int main(int argc, char *argv[])
         // Configure fixed-probability connector
         //------------------------------------------------------------------------
         // Create arrays to hold pre-synaptic currents
-        auto outCurrents = allocateHostDevice<float>(numPre * numBatch);
-        std::fill_n(&outCurrents.first[0], numPre * numBatch, 0.0f);
-        hostToDeviceCopy(outCurrents, numPre * numBatch);
+        const unsigned int numOutCurrents = numPre * numBatch;
+        auto outCurrents = allocateHostDevice<float>(numOutCurrents);
+        std::fill_n(&outCurrents.first[0], numOutCurrents, 0.0f);
+        hostToDeviceCopy(outCurrents, numOutCurrents);
 
         // Allocate, fill and upload weight array
         const unsigned int numSynapses = numPre * numPost;
@@ -463,6 +655,21 @@ int main(int argc, char *argv[])
                                                               weights.second, lambdaV.second, lambdaI.second,
                                                               outCurrents.second, gradients.second);
                     }
+                    else if (mode == ModeSharedAtomic) {
+                        sharedAtomic<<<grid, threads>>>(numPre, numPost, poissonNumSpikes.second, poissonSpikes.second,
+                                                        weights.second, lambdaV.second, lambdaI.second,
+                                                        outCurrents.second, gradients.second);
+                    }
+                    else if (mode == ModeWarpShuffle) {
+                        warpReduction<<<grid, threads >>>(numPre, numPost, poissonNumSpikes.second, poissonSpikes.second,
+                            weights.second, lambdaV.second, lambdaI.second,
+                            outCurrents.second, gradients.second);
+                    }
+                    else if (mode == ModeWarpShuffleLifted) {
+                        warpReductionLifted<< <grid, threads >> > (numPre, numPost, poissonNumSpikes.second, poissonSpikes.second,
+                            weights.second, lambdaV.second, lambdaI.second,
+                            outCurrents.second, gradients.second);
+                    }
                 }
                 
 
@@ -477,9 +684,9 @@ int main(int argc, char *argv[])
 
         std::cout << "Kernel time:" << kernelTime << " ms" << std::endl;
 
-        deviceToHostCopy(outCurrents, numPost);
-        float meanCurrent = std::accumulate(&outCurrents.first[0], &outCurrents.first[numPost], 0.0f) / (float)numPost;
-        std::cout << "Mean current:" << meanCurrent << ", estimated mean current:" << numPre * poissonRate << std::endl;
+        deviceToHostCopy(outCurrents, numOutCurrents);
+        float meanCurrent = std::accumulate(&outCurrents.first[0], &outCurrents.first[numOutCurrents], 0.0f) / (float)numOutCurrents;;
+        std::cout << "Mean current:" << meanCurrent << ", estimated mean current:" << numPost * poissonRate << std::endl;
     }
     catch(std::exception &ex)
     {
