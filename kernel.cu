@@ -215,7 +215,7 @@ __global__ void globalAtomic(unsigned int numPre, unsigned int numPost, const un
         // Determine how many spikes are in this block
         const unsigned int numSpikesInBlock = (b == (numSpikeBlocks - 1))
             ? ((numSpikes - 1) % BLOCK_SIZE) + 1 : BLOCK_SIZE;
-
+        __syncthreads();
        // Use first row of threads in block to read spikes and row lengths into shared memory
         if (threadIdx.x < numSpikesInBlock) {
             const unsigned int i = d_inSpikes[preBatchOffset + (b * BLOCK_SIZE) + threadIdx.x];
@@ -267,7 +267,7 @@ __global__ void globalAtomicLifted(unsigned int numPre, unsigned int numPost, co
         // Determine how many spikes are in this block
         const unsigned int numSpikesInBlock = (b == (numSpikeBlocks - 1))
             ? ((numSpikes - 1) % BLOCK_SIZE) + 1 : BLOCK_SIZE;
-
+        __syncthreads();
        // Use first row of threads in block to read spikes and row lengths into shared memory
         if (threadIdx.x < numSpikesInBlock) {
             const unsigned int i = d_inSpikes[preBatchOffset + (b * BLOCK_SIZE) + threadIdx.x];
@@ -317,7 +317,7 @@ __global__ void sharedAtomic(unsigned int numPre, unsigned int numPost, const un
         // Determine how many spikes are in this block
         const unsigned int numSpikesInBlock = (b == (numSpikeBlocks - 1))
             ? ((numSpikes - 1) % BLOCK_SIZE) + 1 : BLOCK_SIZE;
-
+        __syncthreads();
         // Use first row of threads in block to read spikes and row lengths into shared memory
         if (threadIdx.x < numSpikesInBlock) {
             const unsigned int i = d_inSpikes[preBatchOffset + (b * BLOCK_SIZE) + threadIdx.x];
@@ -374,7 +374,7 @@ __global__ void warpReduction(unsigned int numPre, unsigned int numPost, const u
         // Determine how many spikes are in this block
         const unsigned int numSpikesInBlock = (b == (numSpikeBlocks - 1))
             ? ((numSpikes - 1) % BLOCK_SIZE) + 1 : BLOCK_SIZE;
-
+        __syncthreads();
         // Use first row of threads in block to read spikes and row lengths into shared memory
         if (threadIdx.x < numSpikesInBlock) {
             const unsigned int i = d_inSpikes[preBatchOffset + (b * BLOCK_SIZE) + threadIdx.x];
@@ -383,30 +383,32 @@ __global__ void warpReduction(unsigned int numPre, unsigned int numPost, const u
 
         __syncthreads();
 
-        // If there is a synapse for this thread to process
-        if (id < numPost) {
-            // Loop through spikes in block
-            for (unsigned int i = 0; i < numSpikesInBlock; i++) {
+        
+        // Loop through spikes in block
+        for (unsigned int i = 0; i < numSpikesInBlock; i++) {
+            // If there is a synapse for this thread to process
+            float outCurrent = 0.0f;
+            if (id < numPost) {
                 // Get postsynaptic index
                 const unsigned int synAddress = (s_spike[i] * numPost) + id;
 
                 // Update gradient and back-propagate
                 d_gradient[synBatchOffset + synAddress] -= (d_lambdaI[postBatchOffset + id] * 5.000000000e+00f);
-                
-                // Calculate output current
-                float outCurrent = d_weights[synAddress] * (d_lambdaV[postBatchOffset + id] - d_lambdaI[postBatchOffset + id]);
-                
-                // Perform warp-level tree reduction into first lane
-                outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 16);
-                outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 8);
-                outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 4);
-                outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 2);
-                outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 1);
 
-                // Issue atomic add on first lane of warp
-                if (lane == 0) {
-                    atomicAdd(&d_outCurrents[preBatchOffset + s_spike[i]], outCurrent);
-                }
+                // Calculate output current
+                outCurrent += d_weights[synAddress] * (d_lambdaV[postBatchOffset + id] - d_lambdaI[postBatchOffset + id]);
+            }
+                
+            // Perform warp-level tree reduction into first lane
+            outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 16);
+            outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 8);
+            outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 4);
+            outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 2);
+            outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 1);
+
+            // Issue atomic add on first lane of warp
+            if (lane == 0) {
+                atomicAdd(&d_outCurrents[preBatchOffset + s_spike[i]], outCurrent);
             }
         }
     }
@@ -440,7 +442,7 @@ __global__ void warpReductionLifted(unsigned int numPre, unsigned int numPost, c
         // Determine how many spikes are in this block
         const unsigned int numSpikesInBlock = (b == (numSpikeBlocks - 1))
             ? ((numSpikes - 1) % BLOCK_SIZE) + 1 : BLOCK_SIZE;
-
+        __syncthreads();
         // Use first row of threads in block to read spikes and row lengths into shared memory
         if (threadIdx.x < numSpikesInBlock) {
             const unsigned int i = d_inSpikes[preBatchOffset + (b * BLOCK_SIZE) + threadIdx.x];
@@ -449,10 +451,11 @@ __global__ void warpReductionLifted(unsigned int numPre, unsigned int numPost, c
 
         __syncthreads();
 
-        // If there is a synapse for this thread to process
-        if (id < numPost) {
-            // Loop through spikes in block
-            for (unsigned int i = 0; i < numSpikesInBlock; i++) {
+        // Loop through spikes in block
+        for (unsigned int i = 0; i < numSpikesInBlock; i++) {
+            // If there is a synapse for this thread to process
+            float outCurrent = 0.0f;
+            if (id < numPost) {
                 // Get postsynaptic index
                 const unsigned int synAddress = (s_spike[i] * numPost) + id;
 
@@ -460,19 +463,19 @@ __global__ void warpReductionLifted(unsigned int numPre, unsigned int numPost, c
                 d_gradient[synBatchOffset + synAddress] -= (lambdaI * 5.000000000e+00f);
 
                 // Calculate output current
-                float outCurrent = d_weights[synAddress] * lambdaVI;
+                outCurrent += d_weights[synAddress] * lambdaVI;
+            }
 
-                // Perform warp-level tree reduction into first lane
-                outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 16);
-                outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 8);
-                outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 4);
-                outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 2);
-                outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 1);
+            // Perform warp-level tree reduction into first lane
+            outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 16);
+            outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 8);
+            outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 4);
+            outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 2);
+            outCurrent += __shfl_down_sync(0xFFFFFFFF, outCurrent, 1);
 
-                // Issue atomic add on first lane of warp
-                if (lane == 0) {
-                    atomicAdd(&d_outCurrents[preBatchOffset + s_spike[i]], outCurrent);
-                }
+            // Issue atomic add on first lane of warp
+            if (lane == 0) {
+                atomicAdd(&d_outCurrents[preBatchOffset + s_spike[i]], outCurrent);
             }
         }
     }
